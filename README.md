@@ -467,3 +467,140 @@ Raw Image
 | **Traceability** | The result JSON records *every* intermediate value — AUs, attention regions, confidence, alternatives |
 | **No human loop** | The system generates, evaluates, and explains its own prediction end-to-end |
 | **Contrastive** | The prompt includes alternatives (sad: 4%) so the LLM can explain *why happy and not sad* |
+
+
+---
+# Replace POSTER V2 with 2 New Competitive Backbones
+
+## Goal
+Remove the slow, custom-trained POSTER V2 and add **two new pretrained models** that can beat the current baselines:
+- ResNet-18 → **71.90%** val accuracy
+- EfficientNet-B4 → **71.58%** val accuracy
+
+We will keep all existing files completely intact. We only add new files and make minimal edits to the model registry.
+
+---
+
+## Why These Two?
+
+### 1. 🥇 ConvNeXt-Tiny (Primary Pick — ~82.5% ImageNet)
+- **Why it wins:** It's a modern CNN that beats Swin Transformers while being simpler to train. At 82.5% ImageNet top-1, it has far more representational power than ResNet-18 (69.8%) or EfficientNet-B4 (74.6%). More capacity = better FER transfer.
+- **GPU cost:** ~28M params, ~4.5G FLOPs — comparable to EfficientNet-B4, so it fits comfortably on RTX 4050/4060 with batch=32.
+- **Training time:** ~6-9h for 50 epochs on your dataset. Much faster than POSTER V2's 18h.
+- **GradCAM compatible:** Pure CNN feature maps, works perfectly with the existing `grad_eclip.py` and `region_parser.py`.
+- **Torchvision support:** `torchvision.models.convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)` — no extra dependencies.
+
+### 2. 🥈 RegNetY-800MF (Speed Pick — ~76.4% ImageNet)
+- **Why it wins vs ResNet-18:** RegNetY includes Squeeze-and-Excitation channel attention, giving it better feature selectivity than ResNet-18 at a similar parameter count (~6.3M).
+- **Trains in ~3-4 hours:** Only 0.8G FLOPs — extremely fast. Perfect as your fast-turnaround model.
+- **Stepping up from 400MF:** RegNetY-800MF (~76.4%) beats RegNetY-400MF (~75.8%) with minimal overhead. It's also fully available in torchvision.
+
+> [!IMPORTANT]
+> **Expected outcome:** ConvNeXt-Tiny should comfortably beat 71.9% (targeting 75-78%). RegNetY-800MF should match or slightly beat ResNet-18 (targeting 72-74%) at half the training time.
+
+---
+
+## Proposed Changes
+
+### New Files
+
+#### [NEW] `src/emotion/convnext.py`
+A new model file following the exact same pattern as `resnet18.py` and `efficientnet_b4.py`:
+- Load `torchvision.models.convnext_tiny(weights=...)`
+- Replace classifier head: `nn.Sequential(nn.LayerNorm(...), nn.Flatten(), nn.Dropout(0.5), nn.Linear(768, num_classes))`
+- Implement `forward()`, `get_features()`, and `get_target_layer()` for GradCAM.
+
+#### [NEW] `src/emotion/regnet.py`
+Same pattern:
+- Load `torchvision.models.regnet_y_800mf(weights=...)`
+- Replace final `fc` layer with `nn.Sequential(nn.Dropout(0.4), nn.Linear(784, num_classes))`
+- Implement `forward()`, `get_features()`, and `get_target_layer()`.
+
+---
+
+### Modified Files
+
+#### [MODIFY] `src/emotion/model.py` (`build_model` function only)
+Add 2 new `elif` branches to the `build_model` factory function at the bottom:
+```python
+elif model_name == "convnext_tiny":
+    from src.emotion.convnext import ConvNeXtTinyFER
+    model = ConvNeXtTinyFER(num_classes=num_classes, pretrained=pretrained)
+elif model_name == "regnet_y_800mf":
+    from src.emotion.regnet import RegNetY800MF_FER
+    model = RegNetY800MF_FER(num_classes=num_classes, pretrained=pretrained)
+```
+**POSTER V2 code is kept in place.** We only add new options.
+
+#### [MODIFY] `scripts/train_classifier.py`
+Add the 2 new models to `ALL_MODELS` list and `BATCH_SIZE_RECOMMENDATIONS` dict:
+```python
+ALL_MODELS = ["poster_v2", "resnet50_cbam", "resnet18", "efficientnet_b4",
+              "convnext_tiny", "regnet_y_800mf"]  # <-- add these two
+
+BATCH_SIZE_RECOMMENDATIONS = {
+    ...
+    "convnext_tiny": 32,
+    "regnet_y_800mf": 64,  # very small, can use bigger batch
+}
+```
+
+#### [MODIFY] `scripts/batch_demo.py` and `scripts/eval_test_folder.py`
+Update the `MODELS` dict to include the new models:
+```python
+MODELS = {
+    "resnet18": "checkpoints/resnet18_best.pth",
+    "efficientnet_b4": "checkpoints/efficientnet_b4_best.pth",
+    "convnext_tiny": "checkpoints/convnext_tiny_best.pth",
+    "regnet_y_800mf": "checkpoints/regnet_y_800mf_best.pth",
+}
+```
+
+#### [MODIFY] `src/emotion/dataset.py`
+Add **RandAugment** to the training transform. This is critical for ConvNeXt to achieve its best performance. The existing transform will be upgraded:
+```python
+# In _get_train_transform:
+transforms.RandAugment(num_ops=2, magnitude=9),   # <-- add this
+```
+
+---
+
+## Training Commands (After Implementation)
+
+```powershell
+# Train ConvNeXt-Tiny (primary — high accuracy)
+uv run python scripts/train_classifier.py --model convnext_tiny --dataset affectnet --data-path dataset_cropped --epochs 50 --lr 1e-4
+
+# Train RegNetY-800MF (fast — quick baseline)
+uv run python scripts/train_classifier.py --model regnet_y_800mf --dataset affectnet --data-path dataset_cropped --epochs 50 --lr 1e-3
+```
+
+---
+
+## Expected Results
+
+| Model | ImageNet Acc | Expected FER Val Acc | Est. Training Time |
+|---|:---:|:---:|:---:|
+| ResNet-18 *(current best)* | 69.8% | 71.90% | ~3h |
+| EfficientNet-B4 *(current)* | 74.6% | 71.58% | ~5h |
+| **RegNetY-800MF** *(new)* | **76.4%** | **~72-74%** | **~3-4h** |
+| **ConvNeXt-Tiny** *(new)* | **82.5%** | **~75-78%** | **~6-9h** |
+
+---
+
+## Verification Plan
+
+1. Run `uv run python scripts/train_classifier.py --model convnext_tiny ...` and verify loss decreases from epoch 1.
+2. Check val accuracy at epoch 10 — should already be near/above current baselines.
+3. Run `uv run python scripts/demo.py --model convnext_tiny --image <test_image>` to verify GradCAM works end-to-end.
+4. Update `README.md` results table once training completes.
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> Please confirm the following before I start coding:
+> 1. Do you want me to remove the `poster_v2` option from the model list entirely, or just leave it in (inactive)?
+> 2. Is your dataset at `dataset_cropped/` with the 8 emotion subfolders? (Needed to verify the dataloader path)
+> 3. Should I use `RandAugment` from torchvision (no extra install needed) or stick with the current augmentations for now?
